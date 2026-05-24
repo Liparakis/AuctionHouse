@@ -150,8 +150,8 @@ final class AuctionInteractiveSession {
       AuctionSessionAutomator.PendingAuctionFile pending = token.get() == null ? null
           : AuctionSessionAutomator.maybePreparePendingAuction(line, sharedRoot.get(), console);
 
-      String wireCommand = AuctionCommandParser.normalizeInteractiveCommand(line, sharedRoot.get(),
-          txnServer.get(), console);
+      String wireCommand = normalizeInteractiveCommand(line, sharedRoot.get(), txnServer.get(),
+          tracker, console);
 
       AuctionCommandSender.CommandResult result = AuctionCommandSender.send(connection, wireCommand,
           DEFAULT_RESPONSE_TIMEOUT_MS);
@@ -176,6 +176,24 @@ final class AuctionInteractiveSession {
       return "reconnect";
     }
     return null;
+  }
+
+  private static String normalizeInteractiveCommand(String line, Path sharedRoot,
+      PeerTransactionServer txnServer, AuctionLiveTracker tracker, PeerFrameConsole console) {
+    String command = AuctionCommandParser.normalizeInteractiveCommand(line, sharedRoot, txnServer,
+        console);
+    String[] args = AuctionCommandParser.parseCommandArgs(command);
+    String currentObjectId = tracker.currentObjectId();
+
+    if (AuctionCommandParser.isBidCommand(command) && args.length == 1 && currentObjectId != null
+        && !currentObjectId.isBlank()) {
+      return CommandWire.placeBid(currentObjectId, AuctionCommandSender.parseDouble(args[0]));
+    }
+    if (AuctionCommandParser.isGetDetailsCommand(command) && args.length == 0
+        && currentObjectId != null && !currentObjectId.isBlank()) {
+      return CommandWire.getAuctionDetails(currentObjectId);
+    }
+    return command;
   }
 
   // handles command result

@@ -9,6 +9,7 @@ import gr.aueb.auctionhouse.server.state.ServerState;
 
 import java.util.HashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -69,6 +70,7 @@ public class AuctionEngine {
     CurrentAuction auction = new CurrentAuction(
         next.objectId(),
         next.sellerToken(),
+        Objects.requireNonNullElse(state.usernameForToken(next.sellerToken()), ""),
         next.description(),
         next.startingPrice(),
         next.durationSeconds()
@@ -91,26 +93,23 @@ public class AuctionEngine {
 
   private void finishActiveAuction(CurrentAuction active) {
     state.activeAuctions().remove(active.objectId());
-    state.pendingTransactions().put(active.objectId(), active);
     System.out.println("[SERVER] finishAuction object=" + active.objectId()
         + " highestBid=" + active.bidSnapshot().highestBid()
         + " winner=" + active.bidSnapshot().highestBidderToken());
 
-    CurrentAuction.BidSnapshot snapshot = active.bidSnapshot();
     updateSellerStatistics(active.sellerToken());
-    broadcastAuctionEnded(active, snapshot);
-    notifyTransactionReady(active);
-  }
 
-  private void notifyTransactionReady(CurrentAuction active) {
-    List<CurrentAuction.BidRecord> ranked = active.rankedEligibleBids(
-        state.connectedPeerTokens(), Set.of());
-    if (ranked.isEmpty()) {
+    TransactionCandidate candidate = firstEligibleCandidate(active, Set.of());
+    if (candidate == null) {
+      broadcastAuctionEnded(active, null);
       System.out.println("[SERVER] transactionSkipped object=" + active.objectId()
           + " reason=no_eligible_bidder");
       return;
     }
-    emitTransactionReady(active, ranked.getFirst().bidderToken(), ranked.getFirst().amount(), false);
+
+    state.pendingTransactions().put(active.objectId(), active);
+    broadcastAuctionEnded(active, candidate);
+    emitTransactionReady(active, candidate, false);
   }
 
   public boolean recordTransactionSuccess(String objectId, String bidderToken) {
@@ -133,11 +132,10 @@ public class AuctionEngine {
         + failedBidderToken);
     updateBidderStatistics(failedBidderToken, false);
 
-    Set<String> excluded = new HashSet<>();
-    excluded.add(failedBidderToken);
-    List<CurrentAuction.BidRecord> ranked = auction.rankedEligibleBids(
-        state.connectedPeerTokens(), excluded);
-    if (ranked.isEmpty()) {
+    Set<String> excludedUsernames = new HashSet<>();
+    excludedUsernames.add(state.usernameForToken(failedBidderToken));
+    TransactionCandidate next = firstEligibleCandidate(auction, excludedUsernames);
+    if (next == null) {
       state.pendingTransactions().remove(objectId);
       state.broadcast(Protocol.event(EventType.TRANSACTION_FAILED, objectId, failedBidderToken));
       System.out.println("[SERVER] transactionFailedFinal object=" + objectId
@@ -145,34 +143,34 @@ public class AuctionEngine {
       return true;
     }
 
-    CurrentAuction.BidRecord next = ranked.getFirst();
-    emitTransactionReady(auction, next.bidderToken(), next.amount(), true);
+    emitTransactionReady(auction, next, true);
     System.out.println("[SERVER] transactionPromoted object=" + objectId + " nextBidder="
-        + next.bidderToken() + " bid=" + next.amount());
+        + next.activeBidderToken() + " bid=" + next.amount());
     return true;
   }
 
-  private void emitTransactionReady(CurrentAuction auction, String bidderToken, double amount,
+  private void emitTransactionReady(CurrentAuction auction, TransactionCandidate candidate,
       boolean promoted) {
-    ServerState.PeerEndpoint sellerEndpoint = state.activePeers().get(auction.sellerToken());
+    ServerState.PeerEndpoint sellerEndpoint = state.activePeerForUsername(auction.sellerUsername());
     if (sellerEndpoint == null) {
       return;
     }
     state.broadcast(Protocol.event(
         promoted ? EventType.TRANSACTION_PROMOTED : EventType.TRANSACTION_READY,
         auction.objectId(),
-        auction.sellerToken(),
-        bidderToken,
+        state.activeTokenForUsername(auction.sellerUsername()),
+        candidate.activeBidderToken(),
         sellerEndpoint.ip(),
         Integer.toString(sellerEndpoint.port()),
-        Double.toString(amount)
+        Double.toString(candidate.amount())
     ));
   }
 
-  private void broadcastAuctionEnded(CurrentAuction active, CurrentAuction.BidSnapshot snapshot) {
-    boolean sold = snapshot.highestBidderToken() != null;
-    String winnerToken = sold ? snapshot.highestBidderToken() : "";
-    String status = sold ? "SOLD" : "NO_WINNER";
+  private void broadcastAuctionEnded(CurrentAuction active, TransactionCandidate candidate) {
+    CurrentAuction.BidSnapshot snapshot = active.bidSnapshot();
+    boolean awarded = candidate != null;
+    String winnerToken = awarded ? candidate.activeBidderToken() : "";
+    String status = awarded ? "AWARDED" : "NO_WINNER";
 
     state.broadcast(Protocol.event(
         EventType.AUCTION_ENDED,
@@ -187,25 +185,66 @@ public class AuctionEngine {
     ));
   }
 
+  private TransactionCandidate firstEligibleCandidate(CurrentAuction auction,
+      Set<String> excludedUsernames) {
+    List<CurrentAuction.BidRecord> ranked = auction.bidHistory();
+    Set<String> seenUsernames = new HashSet<>();
+    Set<String> connectedUsernames = state.connectedPeerUsernames();
+    for (CurrentAuction.BidRecord record : ranked) {
+      String bidderUsername = record.bidderUsername();
+      if (bidderUsername == null
+          || bidderUsername.isBlank()
+          || bidderUsername.equals(auction.sellerUsername())
+          || !seenUsernames.add(bidderUsername)
+          || !connectedUsernames.contains(bidderUsername)
+          || (excludedUsernames != null && excludedUsernames.contains(bidderUsername))) {
+        continue;
+      }
+      String activeBidderToken = state.activeTokenForUsername(bidderUsername);
+      if (activeBidderToken == null || activeBidderToken.isBlank()) {
+        continue;
+      }
+      return new TransactionCandidate(activeBidderToken, bidderUsername, record.amount());
+    }
+    return null;
+  }
+
   private void updateSellerStatistics(String sellerToken) {
     String username = state.usernameForToken(sellerToken);
     if (username == null || username.isBlank()) {
+      System.out.println("[SERVER] statsSkip seller token=" + sellerToken + " reason=no_username");
       return;
     }
     state.userStats().compute(username, (_, stats) -> {
       ServerState.UserStats base = stats == null ? ServerState.UserStats.initial() : stats;
-      return base.incrementSeller();
+      ServerState.UserStats updated = base.incrementSeller();
+      System.out.println("[SERVER] statsUpdate user=" + username
+          + " sellerCount=" + updated.numAuctionsAsSeller()
+          + " bidderCount=" + updated.numAuctionsAsBidder()
+          + " reputation=" + updated.reputationScore());
+      return updated;
     });
   }
 
   private void updateBidderStatistics(String bidderToken, boolean success) {
     String username = state.usernameForToken(bidderToken);
     if (username == null || username.isBlank()) {
+      System.out.println("[SERVER] statsSkip bidder token=" + bidderToken + " reason=no_username");
       return;
     }
     state.userStats().compute(username, (_, stats) -> {
       ServerState.UserStats base = stats == null ? ServerState.UserStats.initial() : stats;
-      return success ? base.recordBidderSuccess() : base.recordAwardFailure();
+      ServerState.UserStats updated = success ? base.recordBidderSuccess()
+          : base.recordAwardFailure();
+      System.out.println("[SERVER] statsUpdate user=" + username
+          + " sellerCount=" + updated.numAuctionsAsSeller()
+          + " bidderCount=" + updated.numAuctionsAsBidder()
+          + " reputation=" + updated.reputationScore());
+      return updated;
     });
+  }
+
+  private record TransactionCandidate(String activeBidderToken, String bidderUsername,
+                                      double amount) {
   }
 }

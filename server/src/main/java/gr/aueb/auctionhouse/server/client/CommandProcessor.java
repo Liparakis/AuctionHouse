@@ -339,7 +339,7 @@ public class CommandProcessor {
       if (auction.isClosedAt(now)) {
         return Protocol.error(ErrorCode.AUCTION_CLOSED, ServerMessages.MSG_AUCTION_TIME_OVER);
       }
-      if (!auction.tryPlaceBid(token, amount, now)) {
+      if (!auction.tryPlaceBid(token, resolveUsernameForToken(token), amount, now)) {
         CurrentAuction.BidWindow window = auction.bidWindowAt(now);
         return Protocol.error(ErrorCode.BID_TOO_LOW,
             ServerMessages.MSG_BID_TOO_LOW + ": bid must be > " + window.minimumAcceptedBid() + " and <= "

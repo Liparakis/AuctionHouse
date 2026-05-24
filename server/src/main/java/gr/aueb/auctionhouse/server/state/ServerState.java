@@ -159,8 +159,32 @@ public class ServerState {
     return first;
   }
 
-  public LinkedHashSet<String> connectedPeerTokens() {
-    return new LinkedHashSet<>(activePeers.keySet());
+  public LinkedHashSet<String> connectedPeerUsernames() {
+    LinkedHashSet<String> usernames = new LinkedHashSet<>();
+    for (PeerEndpoint endpoint : activePeers.values()) {
+      if (endpoint.username() != null && !endpoint.username().isBlank()) {
+        usernames.add(endpoint.username());
+      }
+    }
+    return usernames;
+  }
+
+  public String activeTokenForUsername(String username) {
+    if (username == null || username.isBlank()) {
+      return null;
+    }
+    for (Map.Entry<String, PeerEndpoint> entry : activePeers.entrySet()) {
+      PeerEndpoint endpoint = entry.getValue();
+      if (endpoint != null && username.equals(endpoint.username())) {
+        return entry.getKey();
+      }
+    }
+    return null;
+  }
+
+  public PeerEndpoint activePeerForUsername(String username) {
+    String token = activeTokenForUsername(username);
+    return token == null ? null : activePeers.get(token);
   }
 
   public double reputationForSeller(String sellerToken) {

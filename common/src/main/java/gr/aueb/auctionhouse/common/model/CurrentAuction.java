@@ -2,9 +2,7 @@ package gr.aueb.auctionhouse.common.model;
 
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 
 public class CurrentAuction {
@@ -14,6 +12,7 @@ public class CurrentAuction {
 
   private final String objectId;
   private final String sellerToken;
+  private final String sellerUsername;
   private final String description;
   private final double startingPrice;
   private final int durationSeconds;
@@ -24,14 +23,27 @@ public class CurrentAuction {
 
   public CurrentAuction(String objectId, String sellerToken, String description,
       double startingPrice, int durationSeconds) {
-    this(objectId, sellerToken, description, startingPrice, durationSeconds,
+    this(objectId, sellerToken, "", description, startingPrice, durationSeconds,
         Instant.now().getEpochSecond());
   }
 
   public CurrentAuction(String objectId, String sellerToken, String description,
       double startingPrice, int durationSeconds, long startedAtEpochSecond) {
+    this(objectId, sellerToken, "", description, startingPrice, durationSeconds,
+        startedAtEpochSecond);
+  }
+
+  public CurrentAuction(String objectId, String sellerToken, String sellerUsername,
+      String description, double startingPrice, int durationSeconds) {
+    this(objectId, sellerToken, sellerUsername, description, startingPrice, durationSeconds,
+        Instant.now().getEpochSecond());
+  }
+
+  public CurrentAuction(String objectId, String sellerToken, String sellerUsername,
+      String description, double startingPrice, int durationSeconds, long startedAtEpochSecond) {
     this.objectId = objectId;
     this.sellerToken = sellerToken;
+    this.sellerUsername = sellerUsername == null ? "" : sellerUsername;
     this.description = description;
     this.startingPrice = startingPrice;
     this.durationSeconds = durationSeconds;
@@ -53,6 +65,10 @@ public class CurrentAuction {
 
   public String description() {
     return description;
+  }
+
+  public String sellerUsername() {
+    return sellerUsername;
   }
 
   public double startingPrice() {
@@ -92,6 +108,11 @@ public class CurrentAuction {
   }
 
   public boolean tryPlaceBid(String bidderToken, double amount, long nowEpochSecond) {
+    return tryPlaceBid(bidderToken, "", amount, nowEpochSecond);
+  }
+
+  public boolean tryPlaceBid(String bidderToken, String bidderUsername, double amount,
+      long nowEpochSecond) {
     while (true) {
       BidState current = bidState.get();
       BidWindow window = bidWindowAt(nowEpochSecond);
@@ -105,34 +126,12 @@ public class CurrentAuction {
 
       BidSnapshot nextSnapshot = new BidSnapshot(amount, bidderToken);
       List<BidRecord> nextHistory = insertDescending(current.history(),
-          new BidRecord(bidderToken, amount, nowEpochSecond));
+          new BidRecord(bidderToken, bidderUsername == null ? "" : bidderUsername, amount,
+              nowEpochSecond));
       if (bidState.compareAndSet(current, new BidState(nextSnapshot, nextHistory))) {
         return true;
       }
     }
-  }
-
-  public List<BidRecord> rankedEligibleBids(Set<String> connectedBidderTokens,
-      Set<String> excludedBidderTokens) {
-    Set<String> seen = new LinkedHashSet<>();
-    List<BidRecord> eligible = new ArrayList<>();
-    for (BidRecord record : bidHistory()) {
-      String bidderToken = record.bidderToken();
-      if (bidderToken == null
-          || bidderToken.isBlank()
-          || bidderToken.equals(sellerToken)
-          || !seen.add(bidderToken)) {
-        continue;
-      }
-      if (excludedBidderTokens != null && excludedBidderTokens.contains(bidderToken)) {
-        continue;
-      }
-      if (connectedBidderTokens != null && !connectedBidderTokens.contains(bidderToken)) {
-        continue;
-      }
-      eligible.add(record);
-    }
-    return eligible;
   }
 
   private boolean isLateWindow(long nowEpochSecond) {
@@ -159,7 +158,8 @@ public class CurrentAuction {
   public record BidSnapshot(double highestBid, String highestBidderToken) {
   }
 
-  public record BidRecord(String bidderToken, double amount, long placedAtEpochSecond) {
+  public record BidRecord(String bidderToken, String bidderUsername, double amount,
+                          long placedAtEpochSecond) {
   }
 
   public record BidWindow(double minimumAcceptedBid, double maximumAcceptedBid,

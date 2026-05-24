@@ -20,6 +20,7 @@ public final class ServerHelpCatalog {
       "LOGIN|username|password",
       "LOGOUT",
       "SEND_AUCTION_REQUEST|description|startPrice|durationSec",
+      "SEND_AUCTION_REQUEST|--meta|objectId",
       "GET_CURRENT_AUCTION",
       "BID|objectId|amount",
       "GET_USER_STATS|[username]",

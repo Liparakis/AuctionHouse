@@ -68,6 +68,11 @@ final class AuctionLiveTracker {
     return active.get() != null;
   }
 
+  String currentObjectId() {
+    ActiveAuction current = active.get();
+    return current == null ? null : current.objectId();
+  }
+
   void cancelByUserCommand() {
     active.set(null);
     transientStatus.set(null);

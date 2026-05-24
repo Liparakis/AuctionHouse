@@ -74,10 +74,14 @@ public final class PeerTransactionClient {
         continue;
       }
       if (random.nextDouble() < INBOUND_DROP_PROBABILITY) {
+        LOG.info("[PEER-TXN][GBN] DROP_DATA object=" + objectId + " seq="
+            + message.sequenceNumber());
         continue;
       }
 
       totalPackets = message.totalPackets();
+      LOG.info("[PEER-TXN][GBN] RECV_DATA object=" + objectId + " seq="
+          + message.sequenceNumber() + " expected=" + expectedSeq);
       if (message.sequenceNumber() == expectedSeq) {
         received.put(expectedSeq, decodeChunk(message.metaPayloadBase64()));
         expectedSeq++;
@@ -85,7 +89,10 @@ public final class PeerTransactionClient {
 
       int cumulativeAck = expectedSeq - 1;
       if (cumulativeAck >= 0 && random.nextDouble() <= ACK_SEND_PROBABILITY) {
+        LOG.info("[PEER-TXN][GBN] SEND_ACK object=" + objectId + " ack=" + cumulativeAck);
         send(socket, sellerAddress, TxnWireMessage.packetAck(objectId, cumulativeAck));
+      } else if (cumulativeAck >= 0) {
+        LOG.info("[PEER-TXN][GBN] DROP_ACK object=" + objectId + " ack=" + cumulativeAck);
       }
 
       if (totalPackets > 0 && received.size() == totalPackets) {

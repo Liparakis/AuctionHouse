@@ -1,218 +1,303 @@
-# AuctionHouse Report
+# Αναφορά Υλοποίησης - AuctionHouse
 
-## 1. Summary
+---
 
-This project implements a distributed auction platform with:
+## 0. Buildchain & Εργαλεία
 
-- a central Auction Server over TCP
-- multiple peers that act as sellers and bidders
-- up to 2 simultaneous live auctions
-- reputation-aware auction scheduling
-- peer-to-peer transaction completion over UDP
-- Go-Back-N reliable transfer for metadata files over UDP
+| Εργαλείο | Έκδοση                                           |
+|---|--------------------------------------------------|
+| JDK | OpenJDK 25 LTS, Temurin-25+36                    |
+| Build tool | Gradle 9.5.0                                     |
+| Project type | Gradle multi-module (`common`, `server`, `peer`) |
 
-The codebase is a Gradle multi-module project:
+---
 
-- `common`: shared models, protocol, enums
-- `server`: Auction Server, command handling, auction engine
-- `peer`: interactive/auto peer logic, live tracking, transaction logic
+## 1. Σύνοψη
 
-## 2. High-Level Architecture
+Η εφαρμογή είναι ένα **κατανεμημένο σύστημα δημοπρασιών σε πραγματικό χρόνο**. Αποτελείται από
+έναν κεντρικό `Auction Server` και πολλούς `Peers`, οι οποίοι μπορούν να λειτουργούν είτε ως
+πωλητές είτε ως αγοραστές.
 
-### 2.1 Server
+### Υποστηριζόμενες λειτουργίες
 
-The Auction Server is responsible for:
+- Εγγραφή και σύνδεση χρηστών
+- Υποβολή αντικειμένων για δημοπρασία
+- Έως **2 ενεργές δημοπρασίες ταυτόχρονα**
+- Ταυτόχρονες συνδέσεις πολλών peers
+- Υποβολή και έλεγχος bids
+- Ενημέρωση peers με events σε πραγματικό χρόνο
+- Peer-to-peer `transaction` μετά τη λήξη της δημοπρασίας
+- Μεταφορά metadata αρχείου μέσω **UDP** με **Go-Back-N**
+- Fallback ανάθεση σε επόμενο bidder όταν ο awarded bidder αποτυγχάνει ή ακυρώνει
+- Ενημέρωση `reputation_score`, `num_auctions_seller`, `num_auctions_bidder`
 
-- registering and authenticating users
-- storing per-user stats:
-  - `num_auctions_seller`
-  - `num_auctions_bidder`
-  - `reputation_score`
-- keeping a queue of pending auction requests
-- keeping up to 2 active auctions at the same time
-- selecting the next auction by comparing the reputation of the first two queued sellers
-- validating bids according to the assignment formulas
-- ending auctions and triggering transactions
-- handling fallback assignment when the highest bidder cancels
+### Βασική ροή
 
-### 2.2 Peer
+```text
+Login -> PEER_LISTEN -> SEND_AUCTION_REQUEST -> [queue] -> Auction starts
+-> BIDs -> Auction ends -> AWARDED / NO_WINNER -> Transaction -> Completion / Failure
+```
 
-Each peer acts as:
+---
 
-- TCP client of the Auction Server
-- UDP server for incoming metadata transfers when it is a seller
-- UDP client when it is a buyer and must complete a transaction
+## 2. Αρχιτεκτονική
 
-Two peer modes exist:
+### 2.1 Auction Server
 
-- `interactive`: manual commands
-- `auto`: automated bidding and auction submission for testing
+Ο server είναι το κεντρικό κομμάτι του συστήματος. Λειτουργεί με **ένα thread ανά client** και
+προστατεύει τα shared δεδομένα με locks και thread-safe δομές.
 
-## 3. Auction Logic
+**Αρμοδιότητες:**
 
-### 3.1 Simultaneous auctions
+- Διαχείριση χρηστών και passwords
+- Δημιουργία και ακύρωση session tokens
+- Αποθήκευση active peer endpoints
+- Διαχείριση ουράς δημοπρασιών
+- Διατήρηση μέχρι **2 ενεργών δημοπρασιών**
+- Επιλογή νέας δημοπρασίας με βάση το `reputation_score` των δύο πρώτων sellers στην ουρά
+- Έλεγχος και αποδοχή bids
+- Αποστολή events σε όλους τους peers
+- Εκκίνηση transaction μετά τη λήξη
+- Προώθηση σε fallback bidder όταν χρειάζεται
+- Ενημέρωση στατιστικών και reputation
 
-The server supports at most 2 active auctions at any time.
+### 2.2 Peer / Bidder
 
-When a slot becomes free:
+Κάθε peer λειτουργεί τόσο ως **client** απέναντι στον server όσο και ως endpoint για peer-to-peer
+συναλλαγές.
 
-1. the server checks the first 2 items in the queue
-2. it compares the sellers' `reputation_score`
-3. it starts the item whose seller has higher reputation
+**Αρμοδιότητες:**
 
-### 3.2 Bidding
+- Σύνδεση στον Auction Server
+- `REGISTER`, `LOGIN`, `LOGOUT`
+- Διαχείριση τοπικού `shared_directory`
+- Δημιουργία ή χρήση metadata files
+- Αποστολή `SEND_AUCTION_REQUEST`
+- Παρακολούθηση ενεργών δημοπρασιών
+- Υποβολή bids
+- Εκτέλεση peer-to-peer transaction ως buyer ή seller
 
-Bids are object-scoped:
+**Modes λειτουργίας:**
 
-- `BID|objectId|amount`
+| Mode | Χρήση |
+|---|---|
+| `interactive` | Manual demo |
+| `auto` | Automated testing με πολλούς peers |
 
-The server validates all bids server-side.
+### 2.3 Peer-to-Peer Transaction
 
-Rules:
+Μετά τη λήξη της δημοπρασίας, ο buyer επικοινωνεί απευθείας με τον seller μέσω **UDP**.
 
-- normal phase:
-  - `NewBid = HighestBid * (1 + RAND/10)`
-  - increase up to 10%
-- last 10% of auction duration:
-  - increase up to 20%
+Η μεταφορά του metadata file γίνεται με **Go-Back-N**, άρα:
 
-The current implementation enforces:
+- τα δεδομένα σπάνε σε πακέτα `64 bytes`
+- το window size είναι `N = 3`
+- κάθε πακέτο έχει sequence number
+- ο buyer στέλνει cumulative ACKs
+- αν λήξει timeout `2 sec`, ο seller επαναμεταδίδει από το παλαιότερο μη επιβεβαιωμένο πακέτο
 
-- bid must be strictly greater than current highest bid
-- bid must not exceed the maximum allowed random-window cap for the current phase
-- seller cannot bid on its own auction
+> Σημείωση: Σε LAN λειτουργεί κανονικά. Σε public internet απαιτείται port forwarding ή VPN,
+> επειδή δεν υπάρχει NAT traversal.
 
-### 3.3 End of auction
+---
 
-When an auction expires:
+## 3. Δομή Project
 
-- the highest bid is selected
-- the auction is moved to pending transaction state
-- the server broadcasts transaction readiness
+```text
+AuctionHouse/
+|-- common/          # Models, protocol, parsing, enums, message types
+|-- server/          # Server logic & handlers
+|-- peer/            # Peer client & transaction logic
+|-- bin/             # Compiled binaries & run scripts
+|-- screenshots/     # Screenshots για την αναφορά
+|-- build.gradle
+|-- settings.gradle
+`-- REPORT.md
+```
 
-If the top bidder cancels:
+### 3.1 common
 
-- reputation is decreased
-- the server promotes the next eligible connected bidder
-- if nobody is left, the transaction fails permanently
+- Models για auctions
+- Protocol builders
+- Parsing / encoding utilities
+- Enums για commands, events, errors
+- Message representations
 
-## 4. Reputation
+### 3.2 server
 
-Each user starts with:
+| Κλάση | Ρόλος |
+|---|---|
+| `ServerMain` | Entry point |
+| `AuctionServer` | Lifecycle & socket accept loop |
+| `ClientHandler` | Per-client thread |
+| `CommandProcessor` | Command dispatch |
+| `AuctionEngine` | Auction state machine |
+| `ServerState` | Shared mutable state |
 
-- `reputation_score = 1.0`
+### 3.3 peer
 
-Update formula:
+- `PeerMain`, `AuctionPeer`
+- Interactive & auto sessions
+- Command parsing / sending
+- Live event tracking
+- Transaction logic
+- Console UI
 
-`new_reputation = (1 - beta) * old_reputation + beta * outcome`
+---
 
-Where:
+## 4. Protocol
 
-- `beta = 0.25`
-- `outcome = 1` on successful purchase
-- `outcome = 0` on cancellation/failure by awarded bidder
+Όλα τα μηνύματα είναι plain text, `\n`-terminated, με `|` ως delimiter.
 
-## 5. Transaction over UDP
+```text
+COMMAND|arg1|arg2
+OK|code|field1|field2
+ERR|error_code|message
+EVENT|event_type|field1|field2
+```
 
-After auction completion, the buyer contacts the seller peer-to-peer over UDP.
+Για request correlation:
 
-### 5.1 Go-Back-N characteristics
+```text
+requestId#COMMAND|...
+requestId#OK|...
+requestId#ERR|...
+```
+
+> Τα events δεν φέρουν request ID.
+
+---
+
+## 5. Commands
+
+### Guest (unauthenticated)
+
+| Command | Περιγραφή |
+|---|---|
+| `PING` | Liveness check |
+| `HELLO` | Handshake |
+| `REGISTER|username|password` | Εγγραφή νέου χρήστη |
+| `LOGIN|username|password` | Σύνδεση |
+
+### Authenticated
+
+| Command | Περιγραφή |
+|---|---|
+| `LOGOUT` | Αποσύνδεση |
+| `SEND_AUCTION_REQUEST|description|startPrice|durationSec` | Υποβολή αντικειμένου |
+| `SEND_AUCTION_REQUEST|--meta|objectId` | Επαναχρησιμοποίηση υπάρχοντος metadata |
+| `GET_CURRENT_AUCTION` | Επιστρέφει σύνοψη των ενεργών δημοπρασιών |
+| `GET_DETAILS|objectId` | Πλήρεις λεπτομέρειες για συγκεκριμένο active object |
+| `BID|objectId|amount` | Υποβολή προσφοράς |
+| `GET_USER_STATS|[username]` | Στατιστικά χρήστη |
+| `PEER_LISTEN|ip|port` | Δήλωση endpoint |
+| `TRANSACTION_COMPLETE|objectId` | Επιβεβαίωση επιτυχούς transaction |
+| `TRANSACTION_FAILED|objectId` | Δήλωση αποτυχίας / ακύρωσης transaction |
+
+---
+
+## 6. Βασικές Ροές
+
+### Register
+
+```text
+-> REGISTER|peer01|pw
+<- OK|REGISTERED|peer01
+```
+
+### Login
+
+```text
+-> LOGIN|peer01|pw
+<- OK|TOKEN|<token>
+-> PEER_LISTEN|<ip>|<port>
+```
+
+### Auction Request
+
+```text
+-> SEND_AUCTION_REQUEST|demo item|20.0|60
+   ή
+-> SEND_AUCTION_REQUEST|--meta|objectId
+```
+
+### Bid
+
+```text
+-> BID|objectId|25.0
+<- OK|BID_ACCEPTED|objectId|25.0
+```
+
+### Πληροφορίες ενεργών δημοπρασιών
+
+```text
+-> GET_CURRENT_AUCTION
+-> GET_DETAILS|objectId
+```
+
+---
+
+## 7. Events
+
+| Event | Περιγραφή |
+|---|---|
+| `EVENT|AUCTION_QUEUED|...` | Το αντικείμενο μπήκε στην ουρά |
+| `EVENT|AUCTION_STARTED|...` | Έναρξη δημοπρασίας |
+| `EVENT|BID_ACCEPTED|...` | Αποδοχή bid |
+| `EVENT|AUCTION_ENDED|...` | Λήξη δημοπρασίας |
+| `EVENT|AUCTION_CANCELLED|...` | Ακύρωση δημοπρασίας |
+| `EVENT|TRANSACTION_READY|...` | Ο winner πρέπει να ξεκινήσει transaction |
+| `EVENT|TRANSACTION_PROMOTED|...` | Προώθηση στον επόμενο bidder |
+| `EVENT|TRANSACTION_COMPLETED|...` | Επιτυχής ολοκλήρωση |
+| `EVENT|TRANSACTION_FAILED|...` | Οριστική αποτυχία |
+
+### Κατάσταση λήξης δημοπρασίας
+
+Στο `AUCTION_ENDED`:
+
+- `AWARDED` σημαίνει ότι υπάρχει επιλέξιμος bidder και εκκρεμεί transaction
+- `NO_WINNER` σημαίνει ότι η δημοπρασία έληξε χωρίς επιλέξιμο bidder
+
+Το αντικείμενο θεωρείται πραγματικά πωλημένο μόνο μετά από `TRANSACTION_COMPLETED`.
+
+---
+
+## 8. Transaction Protocol
+
+Η peer-to-peer επικοινωνία μετά τη λήξη γίνεται πλέον με UDP και Go-Back-N.
+
+### Βασικά χαρακτηριστικά
 
 - UDP transport
-- payload split into 64-byte chunks
-- sender window size `N = 3`
-- sequence numbers in packets
-- cumulative ACKs from buyer
-- timeout `2 sec`
-- on timeout, seller retransmits from oldest unacknowledged packet
+- πακέτα `64 bytes`
+- `window size = 3`
+- cumulative ACKs
+- `timeout = 2 sec`
+- retransmission σε timeout
 
-### 5.2 Unreliable network simulation
+### Προσομοίωση αναξιόπιστου δικτύου
 
-Buyer behavior:
+Από πλευράς buyer:
 
-- drops incoming data packets with probability 20%
-- sends a needed new ACK with probability 80%
+- drop εισερχόμενου data packet με πιθανότητα `20%`
+- αποστολή νέου ACK με πιθανότητα `80%`
 
-### 5.3 Success path
+### Πιθανότητα ακύρωσης winner
 
-On success:
+Ο highest / awarded bidder:
 
-- buyer reconstructs the metadata file
-- buyer stores it in its `shared_directory`
-- seller deletes the original metadata file
-- buyer informs the server
-- server updates bidder reputation and counters
+- προχωρά σε transaction με πιθανότητα `70%`
+- ακυρώνει με πιθανότητα `30%`
 
-### 5.4 Cancellation path
+Σε ακύρωση:
 
-The awarded bidder proceeds with probability 70% and cancels with probability 30%.
+- ο server μειώνει το `reputation_score`
+- δοκιμάζει fallback bidder
+- αν δεν υπάρχει fallback bidder, η transaction αποτυγχάνει οριστικά
 
-On cancellation:
+---
 
-- buyer informs the server of transaction failure
-- server lowers reputation
-- server promotes the next highest connected bidder
-
-## 6. Important Source Files
-
-### Shared
-
-- `common/src/main/java/gr/aueb/auctionhouse/common/model/CurrentAuction.java`
-- `common/src/main/java/gr/aueb/auctionhouse/common/protocol/builder/CommandWire.java`
-- `common/src/main/java/gr/aueb/auctionhouse/common/protocol/enums/CommandType.java`
-- `common/src/main/java/gr/aueb/auctionhouse/common/protocol/enums/EventType.java`
-- `common/src/main/java/gr/aueb/auctionhouse/common/protocol/enums/OkCode.java`
-
-### Server
-
-- `server/src/main/java/gr/aueb/auctionhouse/server/state/ServerState.java`
-- `server/src/main/java/gr/aueb/auctionhouse/server/auction/AuctionEngine.java`
-- `server/src/main/java/gr/aueb/auctionhouse/server/client/CommandProcessor.java`
-- `server/src/main/java/gr/aueb/auctionhouse/server/client/ClientHandler.java`
-
-### Peer
-
-- `peer/src/main/java/gr/aueb/auctionhouse/peer/core/AuctionAutoSession.java`
-- `peer/src/main/java/gr/aueb/auctionhouse/peer/core/AuctionLiveTracker.java`
-- `peer/src/main/java/gr/aueb/auctionhouse/peer/core/utils/PeerTransactionHandler.java`
-- `peer/src/main/java/gr/aueb/auctionhouse/peer/transaction/PeerTransactionClient.java`
-- `peer/src/main/java/gr/aueb/auctionhouse/peer/transaction/PeerTransactionServer.java`
-- `peer/src/main/java/gr/aueb/auctionhouse/peer/transaction/ObjectMetadataStore.java`
-
-## 7. Commands and Protocol
-
-### Guest commands
-
-- `PING`
-- `HELLO`
-- `REGISTER|username|password`
-- `LOGIN|username|password`
-
-### Authenticated commands
-
-- `LOGOUT`
-- `SEND_AUCTION_REQUEST|description|startPrice|durationSec`
-- `PEER_LISTEN|ip|port`
-- `GET_CURRENT_AUCTION`
-- `GET_DETAILS|objectId`
-- `BID|objectId|amount`
-- `GET_USER_STATS|[username]`
-- `TRANSACTION_COMPLETE|objectId`
-- `TRANSACTION_FAILED|objectId`
-
-### Main server events
-
-- `AUCTION_QUEUED`
-- `AUCTION_STARTED`
-- `BID_ACCEPTED`
-- `AUCTION_ENDED`
-- `AUCTION_CANCELLED`
-- `TRANSACTION_READY`
-- `TRANSACTION_PROMOTED`
-- `TRANSACTION_COMPLETED`
-- `TRANSACTION_FAILED`
-
-## 8. Build and Run
+## 9. Εκτέλεση
 
 ### Build
 
@@ -220,96 +305,202 @@ On cancellation:
 .\gradlew.bat build
 ```
 
-### Create runnable jars and scripts
+### Stage binaries
 
 ```powershell
 .\gradlew.bat stageBin
 ```
 
-### Run server
+### Εκκίνηση Server
 
 ```powershell
 bin\run-server.bat
 ```
 
-### Run peer
+### Εκκίνηση Peer
 
 ```powershell
 bin\run-peer.bat
 ```
 
-### Shared object directory
+### Shared directory
 
 ```text
-bin/shared_objects/<peer-name>/
+bin/shared_objects/<username>/
 ```
 
-## 9. Tests and Verification
+---
 
-Automated tests added:
+## 10. Προβλήματα & Λύσεις
 
-- `common/src/test/java/gr/aueb/auctionhouse/common/model/CurrentAuctionTest.java`
-- `common/src/test/java/gr/aueb/auctionhouse/common/protocol/builder/CommandWireTest.java`
-- `server/src/test/java/gr/aueb/auctionhouse/server/state/ServerStateTest.java`
+### Ταυτόχρονα events και responses
 
-Verified with:
+Από το ίδιο socket φτάνουν τόσο απαντήσεις σε commands όσο και asynchronous events. Π.χ. ενώ
+ένας peer περιμένει απάντηση σε `BID`, μπορεί να φτάσει πρώτα `EVENT|BID_ACCEPTED`.
 
-```powershell
-.\gradlew.bat build
-.\gradlew.bat stageBin
+**Λύση:** Διαχωρισμός responses και events σε ξεχωριστές queues.
+
+---
+
+### Race conditions στα bids
+
+Πολλοί peers που κάνουν bid σχεδόν ταυτόχρονα μπορούν να διαβάσουν την ίδια παλιά τιμή.
+
+**Λύση:** Atomic state update και server-side locking για κάθε bid.
+
+---
+
+### Λήξη δημοπρασίας και late bids
+
+Υπήρχε race condition μεταξύ λήξης της δημοπρασίας και άφιξης νέου bid.
+
+**Λύση:** Έλεγχος `remaining time` πριν από κάθε αποδοχή bid.
+
+---
+
+### Session identity μετά από reconnect
+
+Υπήρχε περίπτωση bidder να αποσυνδεθεί και να ξανασυνδεθεί, αλλά η λογική fallback /
+transaction να κρατάει παλιό token session.
+
+**Λύση:** Ευθυγράμμιση της eligibility λογικής με την τρέχουσα identity του χρήστη ώστε να
+μην εμφανίζεται ασυνέπεια τύπου `winner` αλλά `no_eligible_bidder`.
+
+---
+
+### Κατάσταση `SOLD` έναντι `AWARDED`
+
+Αρχικά η εφαρμογή εμφάνιζε `SOLD` αμέσως με τη λήξη της δημοπρασίας, κάτι που ήταν λογικά
+λανθασμένο όταν το transaction δεν είχε ακόμη ολοκληρωθεί.
+
+**Λύση:** Στο `AUCTION_ENDED` η κατάσταση είναι πλέον:
+
+- `AWARDED` όταν υπάρχει επιλέξιμος bidder
+- `NO_WINNER` όταν δεν υπάρχει επιλέξιμος bidder
+
+Το τελικό success φαίνεται από το `TRANSACTION_COMPLETED`.
+
+---
+
+### Αποσύνδεση seller
+
+Αν ο seller αποσυνδεθεί κατά τη διάρκεια ενεργής δημοπρασίας, απαιτείται άμεση ακύρωση.
+
+**Λύση:** Cleanup του session, αφαίρεση active endpoint, αποστολή `EVENT|AUCTION_CANCELLED`
+σε όλους.
+
+---
+
+### Λάθος advertised IP
+
+Σε tests μεταξύ διαφορετικών μηχανημάτων, το `127.0.0.1` δεν είναι επαρκές για P2P
+transactions.
+
+**Λύση:** Υποστήριξη explicit advertised IP και χρήση του δηλωμένου peer endpoint.
+
+---
+
+### Metadata duplication
+
+Με `--meta`, η χρήση υπάρχοντος αντικειμένου μπορούσε να δημιουργήσει δεύτερο metadata file.
+
+**Λύση:** Το flow ελέγχει αν υπάρχει ήδη το file και το επαναχρησιμοποιεί.
+
+---
+
+### Καθαρισμός metadata μετά τη συναλλαγή
+
+Απαιτείται το metadata να υπάρχει στον buyer και να αφαιρείται από τον seller σωστά.
+
+**Λύση:** Ξεχωριστό transaction flow με επιβεβαίωση προς τον server (`TRANSACTION_COMPLETE`).
+
+---
+
+### Console rendering
+
+Στο interactive mode, live auction updates και user input μπορούσαν να ανακατευτούν.
+
+**Λύση:** Ξεχωριστός live tracker / formatter.
+
+---
+
+### Command delimiter
+
+Στην υλοποίηση χρησιμοποιείται `|` ως delimiter μεταξύ πεδίων, π.χ.:
+
+```text
+SEND_AUCTION_REQUEST|description|startPrice|durationSec
 ```
 
-Both commands completed successfully.
+Αυτό εξασφαλίζει καθαρό parsing ακόμη και σε descriptions με κενά.
 
-## 10. End-to-End Evidence
+---
 
-A validated end-to-end automated run was captured under:
+## 11. Screenshots
 
-- `bin/logs/e2e/20260524-064413/`
+### Εγγραφή peer
+![Register peer](screenshots/User-registry.png)
 
-Useful files:
+### Σύνδεση peer
+![Login peer](screenshots/User-Login.png)
 
-- `server.out.log`
-- `peer-sellerA.err.log`
-- `peer-sellerB.err.log`
-- `peer-buyerA.err.log`
-- `peer-buyerB.err.log`
+### Αποσύνδεση peer
+![Logout peer](screenshots/User-Logout.png)
 
-This run demonstrates:
+### Enqueue δημοπρασίας
+![Auction enqueue](screenshots/Auction-Enqueue.png)
 
-- 2 simultaneous auctions started
-- bidding on both auctions
-- bidder cancellation
-- fallback promotion to next bidder
-- successful UDP metadata transfer
-- successful transaction completion after promotion
+### Αποδοχή bid
+![Bid accepted](screenshots/Bid-Acceptance.png)
 
-Examples from the server log:
+### Λήξη δημοπρασίας / ανάθεση
+![Auction awarded](screenshots/After-Auction-End.png)
 
-- `startAuction object=854409d9-...`
-- `startAuction object=85a64b09-...`
-- `transactionFailed object=854409d9-... bidder=...`
-- `transactionPromoted object=854409d9-... nextBidder=...`
-- `transactionComplete object=854409d9-... bidder=...`
+### Επιτυχής ολοκλήρωση συναλλαγής
+![Transaction complete](screenshots/Transaction-Complete.png)
 
-Examples from peer logs:
+### Ακύρωση δημοπρασίας / αποτυχία ροής
+![Auction cancellation](screenshots/Auction-Cancellation.png)
 
-- `TXN cancelled by winner object=...`
-- `Completed UDP transaction - object=...`
+### Μείωση reputation
+![Reputation decreased](screenshots/Reputation-Decreased.png)
+---
 
-## 11. Known Limitations
+## 12. Γνωστά Security Gaps
 
-- The report screenshots folder still contains older screenshots from the previous version and should be refreshed for final submission.
-- The auto peers are useful for stress/testing, but they generate aggressive bid traffic and are not meant to represent realistic user behavior.
-- The server resolves transaction success/failure from peer notifications and log evidence; it is not a durable database-backed system.
+> Το σύστημα είναι σχεδιασμένο για ακαδημαϊκή χρήση σε controlled περιβάλλον. Η παρακάτω λίστα
+> καταγράφει γνωστά κενά ασφαλείας που δεν αντιμετωπίζονται στην τρέχουσα υλοποίηση. Το σύστημα
+> δεν είναι production-ready.
 
-## 12. Conclusion
+### Transport & Encryption
 
-The final implementation now matches the updated assignment direction:
+Δεν υπάρχει TLS στην επικοινωνία client-server ούτε στο peer-to-peer transaction channel. Άρα
+passwords, session tokens και metadata μεταφέρονται plaintext.
 
-- 2 live auctions
-- bid growth rule with 10% and late 20% phases
-- UDP transaction with Go-Back-N
-- probabilistic buyer cancellation
-- reputation-based fallback and scheduling
+### Authentication & Session Management
 
+| # | Gap |
+|---|---|
+| 1 | Δεν υπάρχει account lockout ή brute-force protection |
+| 2 | Δεν υπάρχει replay protection |
+| 3 | Δεν υπάρχει HMAC / message authentication |
+| 4 | Δεν υπάρχει token theft protection |
+| 5 | Δεν υπάρχει username enumeration protection |
+| 6 | Δεν υπάρχει ισχυρή πολιτική κωδικών / rotation |
+
+### Peer Identity & P2P Security
+
+| # | Gap |
+|---|---|
+| 7 | Δεν υπάρχει ισχυρή peer identity verification στο P2P |
+| 8 | Δεν υπάρχει πλήρης validation ότι το advertised peer IP ανήκει πράγματι στον peer |
+| 9 | Υπάρχει ευαισθησία σε spoofing αν διαρρεύσει token |
+
+### Authorization & Access Control
+
+| # | Gap |
+|---|---|
+| 10 | Δεν υπάρχει role-based authorization πέρα από το τρέχον session context |
+| 11 | Δεν υπάρχει persistent audit backend ή tamper-evident logging |
+
+---

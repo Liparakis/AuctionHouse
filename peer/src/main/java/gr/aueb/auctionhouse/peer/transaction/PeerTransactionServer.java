@@ -112,6 +112,7 @@ public class PeerTransactionServer implements AutoCloseable {
 
     while (base < packets.size()) {
       while (nextSeq < packets.size() && nextSeq < base + WINDOW_SIZE) {
+        LOG.info("[PEER-TXN][GBN] SEND object=" + objectId + " seq=" + nextSeq + " base=" + base);
         send(buyerAddress, packets.get(nextSeq));
         nextSeq++;
       }
@@ -120,9 +121,13 @@ public class PeerTransactionServer implements AutoCloseable {
         DatagramPacket ackPacket = receivePacket(ACK_TIMEOUT_MS);
         TxnWireMessage ack = parse(ackPacket);
         if (ack.type() == TxnWireType.TXN_PACKET_ACK && objectId.equals(ack.objectId())) {
+          LOG.info("[PEER-TXN][GBN] ACK object=" + objectId + " ack=" + ack.ackSequenceNumber()
+              + " oldBase=" + base);
           base = Math.max(base, ack.ackSequenceNumber() + 1);
         }
       } catch (SocketTimeoutException ex) {
+        LOG.warning("[PEER-TXN][GBN] TIMEOUT object=" + objectId + " base=" + base
+            + " nextSeq=" + nextSeq + " retransmit_from=" + base);
         nextSeq = base;
       }
     }
