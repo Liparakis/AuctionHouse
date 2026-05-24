@@ -1,0 +1,229 @@
+allprojects {
+    group = 'gr.aueb.auctionhouse'
+    version = '1.0-SNAPSHOT'
+
+    repositories {
+        mavenCentral()
+    }
+}
+
+subprojects {
+    apply plugin: 'java'
+
+    dependencies {
+        testImplementation platform('org.junit:junit-bom:6.0.0')
+        testImplementation 'org.junit.jupiter:junit-jupiter'
+        testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    }
+
+    test {
+        useJUnitPlatform()
+    }
+}
+
+def binDir = rootProject.layout.projectDirectory.dir('bin')
+def jarsDir = rootProject.layout.projectDirectory.dir('bin/jars')
+
+project(':server') {
+    tasks.register('fatJar', Jar) {
+        group = 'distribution'
+        description = 'Builds a self-contained server fat jar under {root}/bin/jars.'
+
+        archiveBaseName = 'auction-server'
+        archiveVersion = ''
+        archiveClassifier = 'all'
+        destinationDirectory = jarsDir
+        duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+
+        manifest {
+            attributes('Main-Class': 'gr.aueb.auctionhouse.server.ServerMain')
+        }
+
+        from sourceSets.main.output
+        dependsOn configurations.runtimeClasspath
+        from {
+            configurations.runtimeClasspath.collect { cp ->
+                cp.isDirectory() ? cp : zipTree(cp)
+            }
+        }
+
+        exclude 'META-INF/*.SF', 'META-INF/*.DSA', 'META-INF/*.RSA'
+    }
+}
+
+project(':peer') {
+    tasks.register('fatJar', Jar) {
+        group = 'distribution'
+        description = 'Builds a self-contained peer fat jar under {root}/bin/jars.'
+
+        archiveBaseName = 'auction-peer'
+        archiveVersion = ''
+        archiveClassifier = 'all'
+        destinationDirectory = jarsDir
+        duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+
+        manifest {
+            attributes('Main-Class': 'gr.aueb.auctionhouse.peer.PeerMain')
+        }
+
+        from sourceSets.main.output
+        dependsOn configurations.runtimeClasspath
+        from {
+            configurations.runtimeClasspath.collect { cp ->
+                cp.isDirectory() ? cp : zipTree(cp)
+            }
+        }
+
+        exclude 'META-INF/*.SF', 'META-INF/*.DSA', 'META-INF/*.RSA'
+    }
+}
+
+tasks.register('writeRunScripts') {
+    group = 'distribution'
+    description = 'Writes server/peer launcher .bat scripts under {root}/bin.'
+    dependsOn ':server:fatJar', ':peer:fatJar'
+
+    doLast {
+        def outDir = binDir.asFile
+        outDir.mkdirs()
+
+        def serverLauncher = new File(outDir, 'run-server.bat')
+        serverLauncher.text = """@echo off
+setlocal EnableDelayedExpansion
+set "BIN_DIR=%~dp0"
+set "JARS_DIR=%BIN_DIR%jars"
+
+set "SERVER_PORT=%~1"
+if "%SERVER_PORT%"=="" (
+  set /p SERVER_PORT=Server port [5050]:
+  if "!SERVER_PORT!"=="" set "SERVER_PORT=5050"
+)
+
+set "BIND_IP=%~2"
+if "%BIND_IP%"=="" (
+  set /p BIND_IP=Bind IP [0.0.0.0]:
+  if "!BIND_IP!"=="" set "BIND_IP=0.0.0.0"
+)
+
+java -jar "%JARS_DIR%\\auction-server-all.jar" !SERVER_PORT! !BIND_IP!
+endlocal
+"""
+
+        def peerLauncher = new File(outDir, 'run-peer.bat')
+        peerLauncher.text = """@echo off
+setlocal EnableDelayedExpansion
+set "BIN_DIR=%~dp0"
+set "JARS_DIR=%BIN_DIR%jars"
+set "PEER_ARGS=%*"
+
+if "%~1"=="" (
+  set /p SERVER_HOST=Server host [127.0.0.1]:
+  if "!SERVER_HOST!"=="" set "SERVER_HOST=127.0.0.1"
+  set /p SERVER_PORT=Server port [5050]:
+  if "!SERVER_PORT!"=="" set "SERVER_PORT=5050"
+  set "PEER_ARGS=!SERVER_HOST! !SERVER_PORT!"
+)
+
+set /p PEER_LISTEN_IP=Advertised listen IP (blank=auto):
+set "LISTEN_IP_OPT="
+if not "%PEER_LISTEN_IP%"=="" set "LISTEN_IP_OPT=-Dauction.peer.listen.ip=%PEER_LISTEN_IP%"
+
+java --enable-native-access=ALL-UNNAMED !LISTEN_IP_OPT! -jar "%JARS_DIR%\\auction-peer-all.jar" !PEER_ARGS!
+endlocal
+"""
+
+        def stressLauncherBat = new File(outDir, 'run-stress50.bat')
+        stressLauncherBat.text = """@echo off
+setlocal
+powershell -ExecutionPolicy Bypass -File "%~dp0stress-50.ps1" %*
+endlocal
+"""
+
+        def stressLauncherPs1 = new File(outDir, 'stress-50.ps1')
+        stressLauncherPs1.text = '''param(
+    [int]$DurationSec = 120,
+    [int]$ServerPort = 5050,
+    [int]$ClientCount = 50,
+    [int]$BaseListenPort = 7100,
+    [switch]$SkipBuild
+)
+
+$ErrorActionPreference = "Stop"
+
+$root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$serverJar = Join-Path $root "bin\\jars\\auction-server-all.jar"
+$peerJar = Join-Path $root "bin\\jars\\auction-peer-all.jar"
+
+if ($ClientCount -lt 1) { throw "ClientCount must be >= 1" }
+
+if (-not $SkipBuild) {
+    Push-Location $root
+    try {
+        Write-Host "[STRESS-50] Running stageBin..."
+        & .\\gradlew.bat stageBin | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "[STRESS-50] stageBin failed (exit $LASTEXITCODE). Continuing with existing jars."
+        }
+    } finally {
+        Pop-Location
+    }
+}
+
+if (!(Test-Path $serverJar)) { throw "Missing server jar: $serverJar" }
+if (!(Test-Path $peerJar)) { throw "Missing peer jar: $peerJar" }
+
+$ts = Get-Date -Format "yyyyMMdd-HHmmss"
+$outDir = Join-Path $root ("bin\\logs\\stress50\\" + $ts)
+New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+$serverOut = Join-Path $outDir "server.out.log"
+$serverCmd = "java -cp ""$serverJar"" gr.aueb.auctionhouse.server.ServerMain $ServerPort 1>""$serverOut"" 2>&1"
+$serverProc = Start-Process -FilePath "cmd.exe" -ArgumentList "/c", $serverCmd -PassThru
+Start-Sleep -Seconds 2
+
+$peerProcs = @()
+for ($i = 1; $i -le $ClientCount; $i++) {
+    $username = ("Peer{0:D3}" -f $i)
+    $listenPort = $BaseListenPort + $i
+    $maxBid = 300 + ($i * 5)
+
+    $pOut = Join-Path $outDir ("peer-" + $username + ".out.log")
+    $peerCmd = "java -cp ""$peerJar"" gr.aueb.auctionhouse.peer.PeerMain auto 127.0.0.1 $ServerPort $username pw $listenPort $maxBid 800 20 60 1>""$pOut"" 2>&1"
+    $proc = Start-Process -FilePath "cmd.exe" -ArgumentList "/c", $peerCmd -PassThru
+    $peerProcs += $proc
+    Start-Sleep -Milliseconds 100
+}
+
+Write-Host "[STRESS-50] Running with $ClientCount clients for $DurationSec seconds..."
+Start-Sleep -Seconds $DurationSec
+
+foreach ($proc in $peerProcs) {
+    if ($null -ne $proc -and !$proc.HasExited) {
+        Stop-Process -Id $proc.Id -Force
+    }
+}
+
+if ($null -ne $serverProc -and !$serverProc.HasExited) {
+    Stop-Process -Id $serverProc.Id -Force
+}
+
+$summary = Join-Path $outDir "summary.txt"
+@(
+    "timestamp=$ts"
+    "durationSec=$DurationSec"
+    "serverPort=$ServerPort"
+    "clientCount=$ClientCount"
+    "logsMerged=true"
+) | Set-Content -Path $summary -Encoding UTF8
+
+Write-Host "[STRESS-50] Done."
+Write-Host "[STRESS-50] Logs: $outDir"
+'''
+    }
+}
+
+tasks.register('stageBin') {
+    group = 'distribution'
+    description = 'Builds fat jars to {root}/bin/jars and writes launcher scripts to {root}/bin.'
+    dependsOn ':server:fatJar', ':peer:fatJar', 'writeRunScripts'
+}
